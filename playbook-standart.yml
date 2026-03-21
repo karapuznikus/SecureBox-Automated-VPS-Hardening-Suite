@@ -1,0 +1,101 @@
+---
+- name: SecureBox Automated Hardening (Dynamic)
+  hosts: localhost
+  connection: local
+  become: yes
+
+  tasks:
+    # 1. Генерируем случайные параметры один раз в начале
+    - name: Генерация случайных параметров безопасности
+      ansible.builtin.set_fact:
+        # 10 случайных символов в нижнем регистре (стандарт для имен в Linux)
+        sec_user: "{{ lookup('password', '/dev/null length=10 chars=ascii_lowercase') }}"
+        # Случайный порт в диапазоне от 45000 до 60000
+        ssh_port: "{{ 60000 | random(start=45000) }}"
+        # 20-значный пароль для sudo
+        sudo_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}"
+
+    # 2. Обновление системы
+    - name: Обновление кэша apt и пакетов
+      ansible.builtin.apt:
+        update_cache: yes
+        upgrade: dist
+
+    # 3. Базовые пакеты
+    - name: Установка базовых утилит ИБ (UFW, Fail2Ban)
+      ansible.builtin.apt:
+        name:
+          - ufw
+          - fail2ban
+          - unattended-upgrades
+        state: present
+
+    # 4. Настройка случайного пользователя
+    - name: Создание случайного пользователя с правами sudo
+      ansible.builtin.user:
+        name: "{{ sec_user }}"
+        shell: /bin/bash
+        groups: sudo
+        append: yes
+        # Хэшируем сгенерированный пароль
+        password: "{{ sudo_password | password_hash('sha512') }}"
+        create_home: yes
+
+    - name: Импорт SSH-ключа клиенту
+      ansible.posix.authorized_key:
+        user: "{{ sec_user }}"
+        state: present
+        key: "{{ lookup('file', '/root/id_ed25519.pub') }}"
+
+    # 5. Настройка UFW под случайный порт
+    - name: Настройка UFW (запрет всего входящего)
+      community.general.ufw:
+        default: deny
+        direction: incoming
+
+    - name: Открытие сгенерированного порта SSH в UFW
+      community.general.ufw:
+        rule: allow
+        port: "{{ ssh_port }}"
+        proto: tcp
+
+    - name: Включение UFW
+      community.general.ufw:
+        state: enabled
+
+    # 6. Харденинг SSH
+    - name: Харденинг SSH (отключение root и паролей)
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^#?Port ', line: 'Port {{ ssh_port }}' }
+        - { regexp: '^#?PermitRootLogin ', line: 'PermitRootLogin no' }
+        - { regexp: '^#?PasswordAuthentication ', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?X11Forwarding ', line: 'X11Forwarding no' }
+      notify: Restart SSH
+
+    # 7. Зачистка следов
+    - name: Удаление публичного ключа из /root/
+      ansible.builtin.file:
+        path: /root/id_ed25519.pub
+        state: absent
+
+    # 8. Вывод данных для клиента
+    - name: Итоговый отчет для пользователя
+      ansible.builtin.debug:
+        msg: 
+          - "=== СЕРВЕР УСПЕШНО ЗАЩИЩЕН ==="
+          - "ВНИМАНИЕ! СОХРАНИТЕ ЭТИ ДАННЫЕ:"
+          - "Новый пользователь: {{ sec_user }}"
+          - "Пароль от sudo: {{ sudo_password }}"
+          - "Новый SSH порт: {{ ssh_port }}"
+          - "Команда для входа: ssh -i ~/.ssh/id_ed25519 {{ sec_user }}@<ВАШ_IP> -p {{ ssh_port }}"
+
+  handlers:
+    - name: Restart SSH
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted

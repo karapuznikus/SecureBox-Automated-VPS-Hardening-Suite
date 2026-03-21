@@ -1,0 +1,249 @@
+---
+- name: SecureBox Maximum Hardening & Audit (CIS Compliance)
+  hosts: localhost
+  connection: local
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    # ==========================================
+    # 1. ИНИЦИАЛИЗАЦИЯ И ОБНОВЛЕНИЕ
+    # ==========================================
+    - name: Генерация случайных параметров безопасности
+      ansible.builtin.set_fact:
+        sec_user: "{{ lookup('password', '/dev/null length=10 chars=ascii_lowercase') }}"
+        ssh_port: "{{ 60000 | random(start=45000) }}"
+        sudo_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}"
+
+    - name: Обновление кэша apt и пакетов
+      ansible.builtin.apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Установка утилит ИБ, сканеров и аудиторов
+      ansible.builtin.apt:
+        name:
+          - ufw
+          - fail2ban
+          - unattended-upgrades
+          - lynis
+          - auditd
+          - acct
+          - sysstat
+          - aide
+          - rkhunter
+          - libpam-tmpdir
+          - debsums
+          - apt-show-versions
+        state: present
+
+    # ==========================================
+    # 2. АУДИТ "ДО" (BASELINE)
+    # ==========================================
+    - name: "[АУДИТ] Первичное сканирование Lynis (ДО настройки)"
+      ansible.builtin.command: lynis audit system --quick
+      register: lynis_raw_before
+      failed_when: false
+
+    - name: "[АУДИТ] Получение начального индекса"
+      ansible.builtin.shell: grep "^hardening_index" /var/log/lynis-report.dat | cut -d= -f2 || echo "N/A"
+      register: score_before
+      changed_when: false
+
+    # ==========================================
+    # 3. НАСТРОЙКА ПОЛЬЗОВАТЕЛЕЙ И ДОСТУПА
+    # ==========================================
+    - name: Создание случайного пользователя с правами sudo
+      ansible.builtin.user:
+        name: "{{ sec_user }}"
+        shell: /bin/bash
+        groups: sudo
+        append: yes
+        password: "{{ sudo_password | password_hash('sha512') }}"
+        create_home: yes
+
+    - name: Импорт SSH-ключа клиенту
+      ansible.posix.authorized_key:
+        user: "{{ sec_user }}"
+        state: present
+        key: "{{ lookup('file', '/root/id_ed25519.pub') }}"
+
+    # ==========================================
+    # 4. ЗАЩИТА СЕТИ (UFW)
+    # ==========================================
+    - name: Настройка UFW (запрет всего входящего)
+      community.general.ufw:
+        default: deny
+        direction: incoming
+
+    - name: Открытие сгенерированного порта SSH в UFW
+      community.general.ufw:
+        rule: allow
+        port: "{{ ssh_port }}"
+        proto: tcp
+
+    - name: Включение UFW
+      community.general.ufw:
+        state: enabled
+
+    # ==========================================
+    # 5. СТРОГИЙ ХАРДЕНИНГ СИСТЕМЫ (CIS BENCHMARKS)
+    # ==========================================
+    - name: Отключение уязвимых модулей ядра и USB (защита от физических атак)
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/securebox-disable.conf
+        content: |
+          install usb-storage /bin/true
+          install dccp /bin/true
+          install sctp /bin/true
+          install rds /bin/true
+          install tipc /bin/true
+        mode: '0644'
+
+    - name: Харденинг параметров ядра (sysctl)
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_set: yes
+        reload: yes
+      loop:
+        - { name: 'fs.suid_dumpable', value: '0' }
+        - { name: 'net.ipv4.conf.all.accept_redirects', value: '0' }
+        - { name: 'net.ipv4.conf.all.send_redirects', value: '0' }
+        - { name: 'net.ipv4.conf.all.accept_source_route', value: '0' }
+        - { name: 'net.ipv4.conf.all.log_martians', value: '1' }
+
+    - name: Настройка легальных баннеров (/etc/issue и /etc/issue.net)
+      ansible.builtin.copy:
+        dest: "{{ item }}"
+        content: |
+          ***************************************************************************
+                                    WARNING
+          This system is restricted to authorized users only. All activities on
+          this system are logged. Unauthorized access will be fully investigated
+          and reported to the appropriate law enforcement agencies.
+          ***************************************************************************
+        mode: '0644'
+      loop:
+        - /etc/issue
+        - /etc/issue.net
+
+    # ==========================================
+    # 6. СТРОГИЙ ХАРДЕНИНГ SSH И FAIL2BAN
+    # ==========================================
+    - name: Параноидальный харденинг SSH конфига
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^#?Port ', line: 'Port {{ ssh_port }}' }
+        - { regexp: '^#?PermitRootLogin ', line: 'PermitRootLogin no' }
+        - { regexp: '^#?PasswordAuthentication ', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?X11Forwarding ', line: 'X11Forwarding no' }
+        - { regexp: '^#?PermitEmptyPasswords', line: 'PermitEmptyPasswords no' }
+        - { regexp: '^#?AllowTcpForwarding ', line: 'AllowTcpForwarding no' }
+        - { regexp: '^#?ClientAliveCountMax ', line: 'ClientAliveCountMax 2' }
+        - { regexp: '^#?LogLevel ', line: 'LogLevel VERBOSE' }
+        - { regexp: '^#?MaxAuthTries ', line: 'MaxAuthTries 3' }
+        - { regexp: '^#?MaxSessions ', line: 'MaxSessions 2' }
+        - { regexp: '^#?TCPKeepAlive ', line: 'TCPKeepAlive no' }
+        - { regexp: '^#?AllowAgentForwarding ', line: 'AllowAgentForwarding no' }
+        - { regexp: '^#?Banner ', line: 'Banner /etc/issue.net' }
+      notify: Restart SSH
+
+    - name: Принудительное отключение паролей в cloud-init
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/50-cloud-init.conf
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        state: present
+      ignore_errors: yes
+      notify: Restart SSH
+
+    - name: Настройка Fail2Ban под новый SSH-порт
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          bantime = 3600
+          findtime = 600
+          maxretry = 3
+          ignoreip = 127.0.0.1/8 ::1
+
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          filter = sshd
+          logpath = /var/log/auth.log
+          maxretry = 3
+          bantime = 3600
+        mode: '0644'
+      notify: Restart Fail2Ban
+
+    - name: Создание бэкапа доступов
+      ansible.builtin.copy:
+        dest: /root/securebox_credentials.txt
+        content: |
+          SecureBox Credentials (v2 Maximum Deployed)
+          Generated: {{ ansible_date_time.iso8601 }}
+          ========================
+          Port: {{ ssh_port }}
+          Username: {{ sec_user }}
+          Password: {{ sudo_password }} (emergency sudo only)
+          Auth Method: SSH Key (required)
+        mode: '0600'
+
+    # ==========================================
+    # 7. ПРИМЕНЕНИЕ НАСТРОЕК И АУДИТ "ПОСЛЕ"
+    # ==========================================
+    - name: Принудительный перезапуск служб перед финальным аудитом
+      ansible.builtin.meta: flush_handlers
+
+    - name: "[АУДИТ] Финальное сканирование Lynis (ПОСЛЕ настройки)"
+      ansible.builtin.command: lynis audit system --quick
+      register: lynis_raw_after
+      failed_when: false
+
+    - name: "[АУДИТ] Получение итогового индекса"
+      ansible.builtin.shell: grep "^hardening_index" /var/log/lynis-report.dat | cut -d= -f2 || echo "N/A"
+      register: score_after
+      changed_when: false
+
+    # ==========================================
+    # 8. ЗАЧИСТКА И ОТЧЕТ
+    # ==========================================
+    - name: Удаление временных файлов установки (Самоуничтожение)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /root/id_ed25519.pub
+        - /root/playbook-v2.yml # Удалит файл с любым именем, если он так назван
+
+    - name: Итоговый отчет для пользователя
+      ansible.builtin.debug:
+        msg: 
+          - "=== SECUREBOX MAXIMUM: АУДИТ И НАСТРОЙКА ЗАВЕРШЕНЫ ==="
+          - "Индекс защиты ДО:    {{ score_before.stdout | default('N/A') }}/100"
+          - "Индекс защиты ПОСЛЕ: {{ score_after.stdout | default('N/A') }}/100"
+          - "----------------------------------------------"
+          - "ВНИМАНИЕ! СОХРАНИТЕ ЭТИ ДАННЫЕ:"
+          - "Новый пользователь: {{ sec_user }}"
+          - "Пароль от sudo: {{ sudo_password }}"
+          - "Новый SSH порт: {{ ssh_port }}"
+          - "Команда: ssh -i ~/.ssh/id_ed25519 {{ sec_user }}@<ВАШ_IP> -p {{ ssh_port }}"
+
+  handlers:
+    - name: Restart SSH
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
+
+    - name: Restart Fail2Ban
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: restarted
+        enabled: yes
