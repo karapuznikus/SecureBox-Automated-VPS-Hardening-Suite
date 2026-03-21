@@ -1,18 +1,16 @@
 ---
-- name: SecureBox Automated Hardening (Dynamic)
+- name: SecureBox Automated Hardening & Audit
   hosts: localhost
   connection: local
   become: yes
+  gather_facts: yes
 
   tasks:
-    # 1. Генерируем случайные параметры один раз в начале
+    # 1. Генерируем случайные параметры
     - name: Генерация случайных параметров безопасности
       ansible.builtin.set_fact:
-        # 10 случайных символов в нижнем регистре (стандарт для имен в Linux)
         sec_user: "{{ lookup('password', '/dev/null length=10 chars=ascii_lowercase') }}"
-        # Случайный порт в диапазоне от 45000 до 60000
         ssh_port: "{{ 60000 | random(start=45000) }}"
-        # 20-значный пароль для sudo
         sudo_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}"
 
     # 2. Обновление системы
@@ -21,23 +19,37 @@
         update_cache: yes
         upgrade: dist
 
-    # 3. Базовые пакеты
-    - name: Установка базовых утилит ИБ (UFW, Fail2Ban)
+    # 3. Установка инструментов
+    - name: Установка базовых утилит ИБ и сканера Lynis
       ansible.builtin.apt:
         name:
           - ufw
           - fail2ban
           - unattended-upgrades
+          - lynis
         state: present
 
-    # 4. Настройка случайного пользователя
+    # ==========================================
+    # АУДИТ "ДО" (BASELINE)
+    # ==========================================
+    - name: "[АУДИТ] Первичное сканирование Lynis (ДО настройки)"
+      ansible.builtin.command: lynis audit system --quick
+      register: lynis_raw_before
+      failed_when: false
+
+    - name: "[АУДИТ] Получение начального индекса"
+      ansible.builtin.shell: grep -i "hardening index" /var/log/lynis.log | tail -n 1 | grep -oP '(?<=index : )\d+'
+      register: score_before
+
+    # ==========================================
+    # БЛОК ХАРДЕНИНГА
+    # ==========================================
     - name: Создание случайного пользователя с правами sudo
       ansible.builtin.user:
         name: "{{ sec_user }}"
         shell: /bin/bash
         groups: sudo
         append: yes
-        # Хэшируем сгенерированный пароль
         password: "{{ sudo_password | password_hash('sha512') }}"
         create_home: yes
 
@@ -47,7 +59,6 @@
         state: present
         key: "{{ lookup('file', '/root/id_ed25519.pub') }}"
 
-    # 5. Настройка UFW под случайный порт
     - name: Настройка UFW (запрет всего входящего)
       community.general.ufw:
         default: deny
@@ -63,8 +74,7 @@
       community.general.ufw:
         state: enabled
 
-    # 6. Харденинг SSH
-    - name: Харденинг SSH (отключение root и паролей)
+    - name: Харденинг основного конфига SSH
       ansible.builtin.lineinfile:
         path: /etc/ssh/sshd_config
         regexp: "{{ item.regexp }}"
@@ -75,27 +85,99 @@
         - { regexp: '^#?PermitRootLogin ', line: 'PermitRootLogin no' }
         - { regexp: '^#?PasswordAuthentication ', line: 'PasswordAuthentication no' }
         - { regexp: '^#?X11Forwarding ', line: 'X11Forwarding no' }
+        - { regexp: '^#?PermitEmptyPasswords', line: 'PermitEmptyPasswords no' }
       notify: Restart SSH
 
-    # 7. Зачистка следов
-    - name: Удаление публичного ключа из /root/
-      ansible.builtin.file:
-        path: /root/id_ed25519.pub
-        state: absent
+    - name: Принудительное отключение паролей в cloud-init
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config.d/50-cloud-init.conf
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        state: present
+      ignore_errors: yes
+      notify: Restart SSH
 
-    # 8. Вывод данных для клиента
+    - name: Настройка Fail2Ban под новый SSH-порт
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          bantime = 3600
+          findtime = 600
+          maxretry = 3
+          ignoreip = 127.0.0.1/8 ::1
+
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          filter = sshd
+          logpath = /var/log/auth.log
+          maxretry = 3
+          bantime = 3600
+        mode: '0644'
+      notify: Restart Fail2Ban
+
+    - name: Создание бэкапа доступов
+      ansible.builtin.copy:
+        dest: /root/securebox_credentials.txt
+        content: |
+          SecureBox Credentials (Ansible Deployed)
+          Generated: {{ ansible_date_time.iso8601 }}
+          ========================
+          Port: {{ ssh_port }}
+          Username: {{ sec_user }}
+          Password: {{ sudo_password }} (emergency sudo only)
+          Auth Method: SSH Key (required)
+        mode: '0600'
+
+    # ==========================================
+    # ПРИМЕНЕНИЕ НАСТРОЕК И АУДИТ "ПОСЛЕ"
+    # ==========================================
+    - name: Принудительный перезапуск служб (SSH, Fail2Ban) перед финальным аудитом
+      ansible.builtin.meta: flush_handlers
+
+    - name: "[АУДИТ] Финальное сканирование Lynis (ПОСЛЕ настройки)"
+      ansible.builtin.command: lynis audit system --quick
+      register: lynis_raw_after
+      failed_when: false
+
+    - name: "[АУДИТ] Получение итогового индекса"
+      ansible.builtin.shell: grep -i "hardening index" /var/log/lynis.log | tail -n 1 | grep -oP '(?<=index : )\d+'
+      register: score_after
+
+    # ==========================================
+    # ЗАЧИСТКА И ОТЧЕТ
+    # ==========================================
+    - name: Удаление временных файлов установки (Самоуничтожение)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /root/id_ed25519.pub
+        - /root/playbook.yml
+
     - name: Итоговый отчет для пользователя
       ansible.builtin.debug:
         msg: 
-          - "=== СЕРВЕР УСПЕШНО ЗАЩИЩЕН ==="
+          - "=== SECUREBOX: АУДИТ И НАСТРОЙКА ЗАВЕРШЕНЫ ==="
+          - "Индекс защиты ДО:    {{ score_before.stdout }}/100"
+          - "Индекс защиты ПОСЛЕ: {{ score_after.stdout }}/100"
+          - "----------------------------------------------"
           - "ВНИМАНИЕ! СОХРАНИТЕ ЭТИ ДАННЫЕ:"
           - "Новый пользователь: {{ sec_user }}"
           - "Пароль от sudo: {{ sudo_password }}"
           - "Новый SSH порт: {{ ssh_port }}"
-          - "Команда для входа: ssh -i ~/.ssh/id_ed25519 {{ sec_user }}@<ВАШ_IP> -p {{ ssh_port }}"
+          - "Команда: ssh -i ~/.ssh/id_ed25519 {{ sec_user }}@<ВАШ_IP> -p {{ ssh_port }}"
 
+  # Обработчики вызываются либо в конце, либо командой flush_handlers
   handlers:
     - name: Restart SSH
       ansible.builtin.systemd:
         name: ssh
         state: restarted
+
+    - name: Restart Fail2Ban
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: restarted
+        enabled: yes
