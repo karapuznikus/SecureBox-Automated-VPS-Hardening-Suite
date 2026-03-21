@@ -1,3 +1,59 @@
+EU
+# SecureBox: Automated VPS Hardening Suite
+
+**SecureBox** is a professional software suite designed for the automated deployment and security hardening of servers running **Ubuntu 24.04 LTS**. Implementing the "Security by Default" philosophy, it transforms a clean OS installation into a hardened node compliant with modern information security standards.
+
+## System Architecture
+
+The project utilizes a hybrid management model:
+
+1.  **Transport Layer (PowerShell 7+):** Executed client-side (Windows/Linux). It generates `ED25519` cryptographic keys, clears `known_hosts` to mitigate Man-In-The-Middle (MITM) risks, and securely delivers configurations to the target server via SCP.
+2.  **Orchestration Layer (Ansible):** Executed locally on the server (Localhost execution). It performs idempotent configuration of all system components.
+3.  **Audit Layer (Lynis):** Conducts automated system audits before and after configuration, providing empirical evidence of security improvements via the Hardening Index.
+
+## Security Profiles
+
+The system offers two distinct configuration tiers:
+
+| Feature | Standard (`playbook-standard.yml`) | Maximum (`playbook-maximum.yml`) |
+| :--- | :--- | :--- |
+| **Lynis Index** | **~67/100** | **~77/100** |
+| **SSH Hardening** | Random port, Key-only auth, Root disabled | + Session limits, timeouts, VERBOSE logging |
+| **Network Security** | UFW (Deny All Inbound), Fail2Ban | + Disabling DCCP, SCTP, RDS, TIPC protocols |
+| **Audit & Monitoring** | Baseline (Lynis) | + `auditd`, `acct`, `sysstat`, `rkhunter`, `AIDE` |
+| **Physical Security** | — | USB-storage module disabling |
+| **Compliance** | General Hardening | **CIS Benchmarks** alignment |
+
+## Key Features
+
+* **Dynamic Randomization:** Every deployment is unique. The system generates random 10-character usernames, SSH ports (45000-60000), and 20-character sudo passwords.
+* **Cryptographic Strength:** Total transition from password-based authentication to `ED25519` ECC keys.
+* **Intelligent Fail2Ban:** Automatically reconfigures the jail to monitor the dynamically generated SSH port.
+* **Cloud-Init Override:** Forcibly overrides insecure default settings provided by cloud vendors (e.g., DigitalOcean, AWS) via `/etc/ssh/sshd_config.d/`.
+* **Automated Cleanup (Anti-Forensics):** Upon successful deployment, the script removes playbooks and public keys from the `/root/` directory, leaving no deployment artifacts behind.
+
+## Deployment Instructions
+
+1.  **Clone the repository:**
+2.  **Select your profile:** Choose either `playbook-standard.yml` or `playbook-maximum.yml` and rename the selected file to **`playbook.yml`**.
+3.  **Execute the Transport Script:** Run the `.ps1` script via PowerShell.
+4.  **Configuration:** Enter the server IP and `root` password when prompted (required twice: for file delivery and Ansible initialization).
+5.  **IMPORTANT:** Securely save the final report generated in the console. **Port 22 will be closed immediately upon completion.**
+
+## Lynis Audit Results
+
+In the **Maximum** profile, the system automatically implements advanced security controls:
+* **File Integrity Monitoring:** Installation of `AIDE`. Due to the intensive indexing process, the initial database must be initialized manually:
+    ```bash
+    sudo aideinit
+    ```
+* **Intrusion Detection:** Integration of the `rkhunter` (Rootkit Hunter) scanner.
+* **Legal Compliance:** Implementation of Legal Banners (banners/motd) in the terminal greeting to warn unauthorized users.
+* **Kernel Hardening:** Tuning system parameters via `sysctl` to mitigate network attacks (e.g., ICMP-redirect protection).
+
+---
+
+RU
 # SecureBox: Automated VPS Hardening Suite
 
 **SecureBox** — это программный комплекс для автоматизированного развертывания и укрепления (hardening) безопасности серверов под управлением **Ubuntu 24.04 LTS**. Проект реализует концепцию "Security by Default", превращая чистую систему в защищенный узел, соответствующий современным стандартам информационной безопасности.
