@@ -38,8 +38,9 @@
       failed_when: false
 
     - name: "[АУДИТ] Получение начального индекса"
-      ansible.builtin.shell: grep -i "hardening index" /var/log/lynis.log | tail -n 1 | grep -oP '(?<=index : )\d+'
+      ansible.builtin.shell: grep "^hardening_index" /var/log/lynis-report.dat | cut -d= -f2 || echo "N/A"
       register: score_before
+      changed_when: false
 
     # ==========================================
     # БЛОК ХАРДЕНИНГА
@@ -142,8 +143,9 @@
       failed_when: false
 
     - name: "[АУДИТ] Получение итогового индекса"
-      ansible.builtin.shell: grep -i "hardening index" /var/log/lynis.log | tail -n 1 | grep -oP '(?<=index : )\d+'
+      ansible.builtin.shell: grep "^hardening_index" /var/log/lynis-report.dat | cut -d= -f2 || echo "N/A"
       register: score_after
+      changed_when: false
 
     # ==========================================
     # ЗАЧИСТКА И ОТЧЕТ
