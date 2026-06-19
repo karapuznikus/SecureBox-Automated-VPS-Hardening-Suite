@@ -221,7 +221,7 @@
         state: absent
       loop:
         - /root/id_ed25519.pub
-        - /root/playbook-v2.yml # Удалит файл с любым именем, если он так назван
+        - /root/playbook.yml # Удалит файл с любым именем, если он так назван
 
     - name: Итоговый отчет для пользователя
       ansible.builtin.debug:
